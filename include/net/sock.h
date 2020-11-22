@@ -73,6 +73,11 @@
 #include <linux/net_tstamp.h>
 #include <net/smc.h>
 
+/* START_OF_KNOX_NPA */
+#define NAP_PROCESS_NAME_LEN	128
+#define NAP_DOMAIN_NAME_LEN	255
+/* END_OF_KNOX_NPA */
+
 /*
  * This structure really needs to be cleaned up.
  * Most of it is for TCP, and not used by any of
@@ -266,7 +271,7 @@ struct sock_common {
   *	@sk_route_nocaps: forbidden route capabilities (e.g NETIF_F_GSO_MASK)
   *	@sk_gso_type: GSO type (e.g. %SKB_GSO_TCPV4)
   *	@sk_gso_max_size: Maximum GSO segment size to build
-  *	@sk_gso_max_segs: Maximum number of GSO segments
+  *	@sk_pacing_shift: scaling factor for TCP Small Queues
   *	@sk_lingertime: %SO_LINGER l_linger setting
   *	@sk_backlog: always used with the per-socket spinlock held
   *	@sk_callback_lock: used with the callbacks in the end of this struct
@@ -446,6 +451,7 @@ struct sock {
 				sk_type      : 16;
 #define SK_PROTOCOL_MAX U8_MAX
 	u16			sk_gso_max_segs;
+	u8			sk_pacing_shift;
 	unsigned long	        sk_lingertime;
 	struct proto		*sk_prot_creator;
 	rwlock_t		sk_callback_lock;
@@ -472,6 +478,20 @@ struct sock {
 #endif
 	struct sock_cgroup_data	sk_cgrp_data;
 	struct mem_cgroup	*sk_memcg;
+	
+	    /* START_OF_KNOX_NPA */
+	uid_t			knox_uid;
+	pid_t			knox_pid;
+	uid_t			knox_dns_uid;
+	char 			domain_name[NAP_DOMAIN_NAME_LEN];
+	char			process_name[NAP_PROCESS_NAME_LEN];
+	uid_t			knox_puid;
+	pid_t			knox_ppid;
+	char			parent_process_name[NAP_PROCESS_NAME_LEN];
+	pid_t			knox_dns_pid;
+	char 			dns_process_name[NAP_PROCESS_NAME_LEN];
+	/* END_OF_KNOX_NPA */
+	
 	void			(*sk_state_change)(struct sock *sk);
 	void			(*sk_data_ready)(struct sock *sk);
 	void			(*sk_write_space)(struct sock *sk);
@@ -2418,5 +2438,26 @@ extern int sysctl_optmem_max;
 
 extern __u32 sysctl_wmem_default;
 extern __u32 sysctl_rmem_default;
+
+/* Default TCP Small queue budget is ~1 ms of data (1sec >> 10)
+ * Some wifi drivers need to tweak it to get more chunks.
+ * They can use this helper from their ndo_start_xmit()
+ */
+static inline void sk_pacing_shift_update(struct sock *sk, int val)
+{
+	if (!sk || !sk_fullsock(sk) || sk->sk_pacing_shift == val)
+		return;
+	sk->sk_pacing_shift = val;
+}
+/* SOCKEV Notifier Events */
+#define SOCKEV_SOCKET   0x00
+#define SOCKEV_BIND     0x01
+#define SOCKEV_LISTEN   0x02
+#define SOCKEV_ACCEPT   0x03
+#define SOCKEV_CONNECT  0x04
+#define SOCKEV_SHUTDOWN 0x05
+
+int sockev_register_notify(struct notifier_block *nb);
+int sockev_unregister_notify(struct notifier_block *nb);
 
 #endif	/* _SOCK_H */

@@ -20,7 +20,7 @@ KCOV_INSTRUMENT_dynamic_debug.o := n
 lib-y := ctype.o string.o vsprintf.o cmdline.o \
 	 rbtree.o radix-tree.o dump_stack.o timerqueue.o\
 	 idr.o int_sqrt.o extable.o \
-	 sha1.o chacha20.o irq_regs.o argv_split.o \
+	 sha1.o chacha.o irq_regs.o argv_split.o \
 	 flex_proportions.o ratelimit.o show_mem.o \
 	 is_single_threaded.o plist.o decompress.o kobject_uevent.o \
 	 earlycpio.o seq_buf.o siphash.o \
@@ -34,6 +34,7 @@ lib-$(CONFIG_DMA_VIRT_OPS) += dma-virt.o
 lib-y	+= kobject.o klist.o
 obj-y	+= lockref.o
 
+KASAN_SANITIZE_find_bit.o := n
 obj-y += bcd.o div64.o sort.o parser.o debug_locks.o random32.o \
 	 bust_spinlocks.o kasprintf.o bitmap.o scatterlist.o \
 	 gcd.o lcm.o list_sort.o uuid.o flex_array.o iov_iter.o clz_ctz.o \

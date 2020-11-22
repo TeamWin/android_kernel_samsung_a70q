@@ -27,7 +27,22 @@ enum mapping_flags {
 	AS_EXITING	= 4, 	/* final truncate in progress */
 	/* writeback related tags are not used */
 	AS_NO_WRITEBACK_TAGS = 5,
+#if defined(CONFIG_SDP)
+	AS_SENSITIVE = __GFP_BITS_SHIFT + 5, /* Group of sensitive pages to be cleaned up */
+#endif
 };
+
+/*
+ * The page cache can be done in larger chunks than
+ * one page, because it allows for more efficient
+ * throughput (it can then be mapped into user
+ * space in smaller chunks for same flexibility).
+ *
+ * Or rather, it _will_ be done in larger chunks.
+ */
+#define PAGE_CACHE_SHIFT	PAGE_SHIFT
+#define PAGE_CACHE_SIZE		PAGE_SIZE
+#define PAGE_CACHE_MASK		PAGE_MASK
 
 /**
  * mapping_set_error - record a writeback error in the address_space
@@ -115,6 +130,25 @@ static inline void mapping_set_gfp_mask(struct address_space *m, gfp_t mask)
 {
 	m->gfp_mask = mask;
 }
+
+#if defined(CONFIG_SDP)
+static inline void mapping_set_sensitive(struct address_space *mapping)
+{
+    set_bit(AS_SENSITIVE, &mapping->flags);
+}
+
+static inline void mapping_clear_sensitive(struct address_space *mapping)
+{
+    clear_bit(AS_SENSITIVE, &mapping->flags);
+}
+
+static inline int mapping_sensitive(struct address_space *mapping)
+{
+    if (mapping)
+        return test_bit(AS_SENSITIVE, &mapping->flags);
+    return !!mapping;
+}
+#endif
 
 void release_pages(struct page **pages, int nr, bool cold);
 
@@ -243,7 +277,7 @@ static inline gfp_t readahead_gfp_mask(struct address_space *x)
 				  __GFP_COLD | __GFP_NORETRY | __GFP_NOWARN;
 }
 
-typedef int filler_t(void *, struct page *);
+typedef int filler_t(struct file *, struct page *);
 
 pgoff_t page_cache_next_hole(struct address_space *mapping,
 			     pgoff_t index, unsigned long max_scan);
@@ -256,6 +290,7 @@ pgoff_t page_cache_prev_hole(struct address_space *mapping,
 #define FGP_WRITE		0x00000008
 #define FGP_NOFS		0x00000010
 #define FGP_NOWAIT		0x00000020
+#define FGP_FOR_MMAP		0x00000040
 
 struct page *pagecache_get_page(struct address_space *mapping, pgoff_t offset,
 		int fgp_flags, gfp_t cache_gfp_mask);
@@ -366,8 +401,16 @@ static inline unsigned find_get_pages(struct address_space *mapping,
 }
 unsigned find_get_pages_contig(struct address_space *mapping, pgoff_t start,
 			       unsigned int nr_pages, struct page **pages);
-unsigned find_get_pages_tag(struct address_space *mapping, pgoff_t *index,
-			int tag, unsigned int nr_pages, struct page **pages);
+unsigned find_get_pages_range_tag(struct address_space *mapping, pgoff_t *index,
+			pgoff_t end, int tag, unsigned int nr_pages,
+			struct page **pages);
+static inline unsigned find_get_pages_tag(struct address_space *mapping,
+			pgoff_t *index, int tag, unsigned int nr_pages,
+			struct page **pages)
+{
+	return find_get_pages_range_tag(mapping, index, (pgoff_t)-1, tag,
+					nr_pages, pages);
+}
 unsigned find_get_entries_tag(struct address_space *mapping, pgoff_t start,
 			int tag, unsigned int nr_entries,
 			struct page **entries, pgoff_t *indices);
@@ -394,7 +437,7 @@ extern int read_cache_pages(struct address_space *mapping,
 static inline struct page *read_mapping_page(struct address_space *mapping,
 				pgoff_t index, void *data)
 {
-	filler_t *filler = (filler_t *)mapping->a_ops->readpage;
+	filler_t *filler = mapping->a_ops->readpage;
 	return read_cache_page(mapping, index, filler, data);
 }
 
@@ -452,8 +495,8 @@ static inline pgoff_t linear_page_index(struct vm_area_struct *vma,
 	pgoff_t pgoff;
 	if (unlikely(is_vm_hugetlb_page(vma)))
 		return linear_hugepage_index(vma, address);
-	pgoff = (address - vma->vm_start) >> PAGE_SHIFT;
-	pgoff += vma->vm_pgoff;
+	pgoff = (address - READ_ONCE(vma->vm_start)) >> PAGE_SHIFT;
+	pgoff += READ_ONCE(vma->vm_pgoff);
 	return pgoff;
 }
 

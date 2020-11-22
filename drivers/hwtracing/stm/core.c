@@ -175,8 +175,9 @@ static int stp_master_alloc(struct stm_device *stm, unsigned int idx)
 {
 	struct stp_master *master;
 	size_t size;
+	unsigned long align = sizeof(unsigned long);
 
-	size = ALIGN(stm->data->sw_nchannels, 8) / 8;
+	size = ALIGN(stm->data->sw_nchannels, align) / align;
 	size += sizeof(struct stp_master);
 	master = kzalloc(size, GFP_ATOMIC);
 	if (!master)
@@ -226,8 +227,8 @@ stm_output_disclaim(struct stm_device *stm, struct stm_output *output)
 	bitmap_release_region(&master->chan_map[0], output->channel,
 			      ilog2(output->nr_chans));
 
-	output->nr_chans = 0;
 	master->nr_free += output->nr_chans;
+	output->nr_chans = 0;
 }
 
 /*
@@ -439,18 +440,21 @@ static ssize_t notrace stm_write(struct stm_data *data, unsigned int master,
 	size_t pos;
 	ssize_t sz;
 
-	for (pos = 0, p = buf; count > pos; pos += sz, p += sz) {
-		sz = min_t(unsigned int, count - pos, 8);
-		sz = data->packet(data, master, channel, STP_PACKET_DATA, flags,
-				  sz, p);
-		flags = 0;
+	if (data->ost_configured()) {
+		pos = data->ost_packet(data, count, buf);
+	} else {
+		for (pos = 0, p = buf; count > pos; pos += sz, p += sz) {
+			sz = min_t(unsigned int, count - pos, 8);
+			sz = data->packet(data, master, channel,
+						STP_PACKET_DATA, flags, sz, p);
+			flags = 0;
+			if (sz < 0)
+				break;
+		}
+		data->packet(data, master, channel, STP_PACKET_FLAG, 0, 0,
+		&nil);
 
-		if (sz < 0)
-			break;
 	}
-
-	data->packet(data, master, channel, STP_PACKET_FLAG, 0, 0, &nil);
-
 	return pos;
 }
 

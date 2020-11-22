@@ -71,6 +71,7 @@ struct eth_dev {
 	unsigned		qmult;
 
 	unsigned		header_len;
+	unsigned int		ul_max_pkts_per_xfer;
 	struct sk_buff		*(*wrap)(struct gether *, struct sk_buff *skb);
 	int			(*unwrap)(struct gether *,
 						struct sk_buff *skb,
@@ -216,9 +217,13 @@ rx_submit(struct eth_dev *dev, struct usb_request *req, gfp_t gfp_flags)
 		size -= size % out->maxpacket;
 	}
 
+	if (dev->ul_max_pkts_per_xfer)
+		size *= dev->ul_max_pkts_per_xfer;
+
 	if (dev->port_usb->is_fixed)
 		size = max_t(size_t, size, dev->port_usb->fixed_out_len);
 
+	DBG(dev, "%s: size: %d\n", __func__, size);
 	skb = __netdev_alloc_skb(dev->net, size + NET_IP_ALIGN, gfp_flags);
 	if (skb == NULL) {
 		DBG(dev, "no rx skb\n");
@@ -287,12 +292,36 @@ static void rx_complete(struct usb_ep *ep, struct usb_request *req)
 			if (status < 0
 					|| ETH_HLEN > skb2->len
 					|| skb2->len > GETHER_MAX_ETH_FRAME_LEN) {
+#ifdef CONFIG_USB_NCM_SUPPORT_MTU_CHANGE
+				/*
+			 	* Need to revisit net->mtu  does not include header size incase of changed MTU
+			 	*/
+				if (!strcmp(dev->port_usb->func.name, "ncm")) {
+					if (status < 0
+						|| ETH_HLEN > skb2->len
+						|| skb2->len > (dev->net->mtu + ETH_HLEN)) {
+						INFO(dev, "usb: %s  drop incase of NCM rx length %d\n",
+							__func__, skb2->len);
+					} else {
+						INFO(dev, "usb: %s  Dont drop incase of NCM rx length %d\n",
+							__func__, skb2->len);
+						goto process_frame;
+					}
+				}
+#endif
 				dev->net->stats.rx_errors++;
 				dev->net->stats.rx_length_errors++;
+#ifndef CONFIG_USB_NCM_SUPPORT_MTU_CHANGE
 				DBG(dev, "rx length %d\n", skb2->len);
+#else
+				INFO(dev, "usb: %s Drop rx length %d\n", __func__, skb2->len);
+#endif
 				dev_kfree_skb_any(skb2);
 				goto next_frame;
 			}
+#ifdef CONFIG_USB_NCM_SUPPORT_MTU_CHANGE
+process_frame:
+#endif
 			skb2->protocol = eth_type_trans(skb2, dev->net);
 			dev->net->stats.rx_packets++;
 			dev->net->stats.rx_bytes += skb2->len;
@@ -586,7 +615,11 @@ static netdev_tx_t eth_start_xmit(struct sk_buff *skb,
 	retval = usb_ep_queue(in, req, GFP_ATOMIC);
 	switch (retval) {
 	default:
+#ifndef CONFIG_USB_NCM_SUPPORT_MTU_CHANGE
 		DBG(dev, "tx queue err %d\n", retval);
+#else
+		INFO(dev, "usb:%s tx queue err %d\n", __func__, retval);
+#endif
 		break;
 	case 0:
 		netif_trans_update(net);
@@ -1079,6 +1112,7 @@ struct net_device *gether_connect(struct gether *link)
 		dev->header_len = link->header_len;
 		dev->unwrap = link->unwrap;
 		dev->wrap = link->wrap;
+		dev->ul_max_pkts_per_xfer = link->ul_max_pkts_per_xfer;
 
 		spin_lock(&dev->lock);
 		dev->port_usb = link;

@@ -6,6 +6,7 @@
  */
 
 #include "dm-core.h"
+#include "dm-ioctrl.h"
 
 #include <linux/module.h>
 #include <linux/vmalloc.h>
@@ -1986,6 +1987,45 @@ void dm_interface_exit(void)
 	dm_hash_exit();
 }
 
+
+/**
+ * dm_ioctl_export - Permanently export a mapped device via the ioctl interface
+ * @md: Pointer to mapped_device
+ * @name: Buffer (size DM_NAME_LEN) for name
+ * @uuid: Buffer (size DM_UUID_LEN) for uuid or NULL if not desired
+ */
+int dm_ioctl_export(struct mapped_device *md, const char *name,
+		    const char *uuid)
+{
+	int r = 0;
+	struct hash_cell *hc;
+
+	if (!md) {
+		r = -ENXIO;
+		goto out;
+	}
+
+	/* The name and uuid can only be set once. */
+	mutex_lock(&dm_hash_cells_mutex);
+	hc = dm_get_mdptr(md);
+	mutex_unlock(&dm_hash_cells_mutex);
+	if (hc) {
+		DMERR("%s: already exported", dm_device_name(md));
+		r = -ENXIO;
+		goto out;
+	}
+
+	r = dm_hash_insert(name, uuid, md);
+	if (r) {
+		DMERR("%s: could not bind to '%s'", dm_device_name(md), name);
+		goto out;
+	}
+
+	/* Let udev know we've changed. */
+	dm_kobject_uevent(md, KOBJ_CHANGE, dm_get_event_nr(md));
+out:
+	return r;
+}
 /**
  * dm_copy_name_and_uuid - Copy mapped device name & uuid into supplied buffers
  * @md: Pointer to mapped_device
@@ -2017,3 +2057,37 @@ out:
 
 	return r;
 }
+
+int __init dm_ioctrl(uint cmd, struct dm_ioctl *param)
+{
+	int r = 0;
+	int ioctl_flags;
+	ioctl_fn fn = NULL;
+	size_t input_param_size;
+
+	/*
+	 * Nothing more to do for the version command.
+	 */
+	if (cmd == DM_VERSION_CMD)
+		return 0;
+
+	DMDEBUG("dm_ctl_ioctl: command 0x%x", cmd);
+
+	fn = lookup_ioctl(cmd, &ioctl_flags);
+	if (!fn) {
+		DMWARN("dm_ctl_ioctl: unknown command 0x%x", cmd);
+		return -ENOTTY;
+	}
+
+	input_param_size = param->data_size;
+	param->data_size = sizeof(*param);
+
+	r = fn(NULL, param, input_param_size);
+
+	if (unlikely(param->flags & DM_BUFFER_FULL_FLAG) &&
+		unlikely(ioctl_flags & IOCTL_FLAGS_NO_PARAMS))
+		DMERR("ioctl %d  but has IOCTL_FLAGS_NO_PARAMS set", cmd);
+
+	return r;
+}
+EXPORT_SYMBOL(dm_ioctrl);

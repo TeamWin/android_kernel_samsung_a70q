@@ -13,6 +13,8 @@
 
 #include <linux/mmc/host.h>
 
+#define cls_dev_to_mmc_host(d)	container_of(d, struct mmc_host, class_dev)
+
 int mmc_register_host_class(void);
 void mmc_unregister_host_class(void);
 
@@ -24,6 +26,9 @@ void mmc_retune_release(struct mmc_host *host);
 int mmc_retune(struct mmc_host *host);
 void mmc_retune_pause(struct mmc_host *host);
 void mmc_retune_unpause(struct mmc_host *host);
+
+void mmc_latency_hist_sysfs_init(struct mmc_host *host);
+void mmc_latency_hist_sysfs_exit(struct mmc_host *host);
 
 static inline void mmc_retune_recheck(struct mmc_host *host)
 {
@@ -49,26 +54,8 @@ static inline int mmc_host_uhs(struct mmc_host *host)
 		 MMC_CAP_UHS_DDR50);
 }
 
-static inline bool mmc_card_hs200(struct mmc_card *card)
-{
-	return card->host->ios.timing == MMC_TIMING_MMC_HS200;
-}
-
-static inline bool mmc_card_ddr52(struct mmc_card *card)
-{
-	return card->host->ios.timing == MMC_TIMING_MMC_DDR52;
-}
-
-static inline bool mmc_card_hs400(struct mmc_card *card)
-{
-	return card->host->ios.timing == MMC_TIMING_MMC_HS400;
-}
-
-static inline bool mmc_card_hs400es(struct mmc_card *card)
-{
-	return card->host->ios.enhanced_strobe;
-}
-
+void mmc_latency_hist_sysfs_init(struct mmc_host *host);
+void mmc_latency_hist_sysfs_exit(struct mmc_host *host);
 
 #endif
 

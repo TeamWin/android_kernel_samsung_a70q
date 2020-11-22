@@ -19,9 +19,17 @@
 #include <asm/bug.h>
 #include <asm/proc-fns.h>
 
+#include <asm/bug.h>
 #include <asm/memory.h>
 #include <asm/pgtable-hwdef.h>
 #include <asm/pgtable-prot.h>
+
+#ifdef CONFIG_UH
+#include <linux/uh.h>
+#ifdef CONFIG_UH_RKP
+#include <linux/rkp.h>
+#endif
+#endif
 
 /*
  * VMALLOC range.
@@ -203,8 +211,43 @@ static inline pmd_t pmd_mkcont(pmd_t pmd)
 
 static inline void set_pte(pte_t *ptep, pte_t pte)
 {
-	*ptep = pte;
+#ifdef CONFIG_ARM64_STRICT_BREAK_BEFORE_MAKE
+	pteval_t old = pte_val(*ptep);
+	pteval_t new = pte_val(pte);
 
+	/* Only problematic if valid -> valid */
+	if (!(old & new & PTE_VALID))
+		goto pte_ok;
+
+	/* Changing attributes should go via an invalid entry */
+	if (WARN_ON((old & PTE_ATTRINDX_MASK) != (new & PTE_ATTRINDX_MASK)))
+		goto pte_bad;
+
+	/* Change of OA is only an issue if one mapping is writable */
+	if (!(old & new & PTE_RDONLY) &&
+	    WARN_ON(pte_pfn(*ptep) != pte_pfn(pte)))
+		goto pte_bad;
+
+	goto pte_ok;
+
+pte_bad:
+	*ptep = __pte(0);
+	dsb(ishst);
+	asm("tlbi	vmalle1is");
+	dsb(ish);
+	isb();
+pte_ok:
+#endif
+
+#ifdef CONFIG_UH_RKP
+	/* bug on double mapping */
+	BUG_ON(pte_val(pte) && rkp_is_pg_dbl_mapped(pte_val(pte)));
+
+	if (rkp_is_pg_protected((u64)ptep)) {
+		uh_call(UH_APP_RKP, RKP_WRITE_PGT3, (u64)ptep, pte_val(pte), 0, 0);
+	} else
+#endif
+	*ptep = pte;
 	/*
 	 * Only if the new pte is valid and kernel, otherwise TLB maintenance
 	 * or update_mmu_cache() have the necessary barriers.
@@ -364,6 +407,7 @@ static inline int pmd_protnone(pmd_t pmd)
 
 #define pud_write(pud)		pte_write(pud_pte(pud))
 #define pud_pfn(pud)		(((pud_val(pud) & PUD_MASK) & PHYS_MASK) >> PAGE_SHIFT)
+#define pfn_pud(pfn,prot)	(__pud(((phys_addr_t)(pfn) << PAGE_SHIFT) | pgprot_val(prot)))
 
 #define set_pmd_at(mm, addr, pmdp, pmd)	set_pte_at(mm, addr, (pte_t *)pmdp, pmd_pte(pmd))
 
@@ -405,6 +449,11 @@ extern pgprot_t phys_mem_access_prot(struct file *file, unsigned long pfn,
 
 static inline void set_pmd(pmd_t *pmdp, pmd_t pmd)
 {
+#ifdef CONFIG_UH_RKP
+	if (rkp_is_pg_protected((u64)pmdp)) {
+		uh_call(UH_APP_RKP, RKP_WRITE_PGT2, (u64)pmdp, pmd_val(pmd), 0, 0);
+	} else
+#endif	
 	*pmdp = pmd;
 	dsb(ishst);
 	isb();
@@ -418,6 +467,11 @@ static inline void pmd_clear(pmd_t *pmdp)
 static inline phys_addr_t pmd_page_paddr(pmd_t pmd)
 {
 	return pmd_val(pmd) & PHYS_MASK & (s32)PAGE_MASK;
+}
+
+static inline unsigned long pmd_page_vaddr(pmd_t pmd)
+{
+	return (unsigned long) __va(pmd_page_paddr(pmd));
 }
 
 /* Find an entry in the third-level page table. */
@@ -456,6 +510,11 @@ static inline phys_addr_t pmd_page_paddr(pmd_t pmd)
 
 static inline void set_pud(pud_t *pudp, pud_t pud)
 {
+#ifdef CONFIG_UH_RKP
+	if (rkp_is_pg_protected((u64)pudp)) {
+		uh_call(UH_APP_RKP, RKP_WRITE_PGT1, (u64)pudp, pud_val(pud), 0, 0);
+	} else
+#endif
 	*pudp = pud;
 	dsb(ishst);
 	isb();
@@ -469,6 +528,11 @@ static inline void pud_clear(pud_t *pudp)
 static inline phys_addr_t pud_page_paddr(pud_t pud)
 {
 	return pud_val(pud) & PHYS_MASK & (s32)PAGE_MASK;
+}
+
+static inline unsigned long pud_page_vaddr(pud_t pud)
+{
+	return (unsigned long) __va(pud_page_paddr(pud));
 }
 
 /* Find an entry in the second-level page table. */
@@ -521,6 +585,11 @@ static inline void pgd_clear(pgd_t *pgdp)
 static inline phys_addr_t pgd_page_paddr(pgd_t pgd)
 {
 	return pgd_val(pgd) & PHYS_MASK & (s32)PAGE_MASK;
+}
+
+static inline unsigned long pgd_page_vaddr(pgd_t pgd)
+{
+	return (unsigned long) __va(pgd_page_paddr(pgd));
 }
 
 /* Find an entry in the frst-level page table. */

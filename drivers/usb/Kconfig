@@ -117,6 +117,8 @@ source "drivers/usb/mtu3/Kconfig"
 
 source "drivers/usb/musb/Kconfig"
 
+source "drivers/usb/notify/Kconfig"
+
 source "drivers/usb/dwc3/Kconfig"
 
 source "drivers/usb/dwc2/Kconfig"
@@ -171,6 +173,8 @@ source "drivers/usb/phy/Kconfig"
 source "drivers/usb/gadget/Kconfig"
 
 source "drivers/usb/typec/Kconfig"
+
+source "drivers/usb/pd/Kconfig"
 
 config USB_LED_TRIG
 	bool "USB LED Triggers"

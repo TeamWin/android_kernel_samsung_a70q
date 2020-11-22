@@ -37,6 +37,7 @@
 #include <linux/mm_types.h>
 
 #include <asm/atomic.h>
+#include <asm/barrier.h>
 #include <asm/bug.h>
 #include <asm/debug-monitors.h>
 #include <asm/esr.h>
@@ -48,6 +49,11 @@
 #include <asm/exception.h>
 #include <asm/system_misc.h>
 #include <asm/sysreg.h>
+#include <trace/events/exception.h>
+
+#ifdef CONFIG_SEC_DEBUG
+#include <linux/sec_debug.h>
+#endif
 
 static const char *handler[]= {
 	"Synchronous Abort",
@@ -58,6 +64,7 @@ static const char *handler[]= {
 
 int show_unhandled_signals = 0;
 
+#ifdef CONFIG_SEC_DEBUG
 /*
  * Dump out the contents of some kernel memory nicely...
  */
@@ -76,6 +83,11 @@ static void dump_mem(const char *lvl, const char *str, unsigned long bottom,
 	set_fs(KERNEL_DS);
 
 	printk("%s%s(0x%016lx to 0x%016lx)\n", lvl, str, bottom, top);
+
+	if (!IS_ENABLED(CONFIG_SEC_DEBUG_DUMP_TASK_STACK)) {
+		pr_warn("CONFIG_SEC_DEBUG_DUMP_TASK_STACK is not enabled!\n");
+		goto done;
+	}
 
 	for (first = bottom & ~31; first < top; first += 32) {
 		unsigned long p;
@@ -98,15 +110,14 @@ static void dump_mem(const char *lvl, const char *str, unsigned long bottom,
 		printk("%s%04lx:%s\n", lvl, first & 0xffff, str);
 	}
 
+done:
 	set_fs(fs);
 }
+#endif
 
 static void dump_backtrace_entry(unsigned long where)
 {
-	/*
-	 * Note that 'where' can have a physical address, but it's not handled.
-	 */
-	print_ip_sym(where);
+	printk(" %pS\n", (void *)where);
 }
 
 static void __dump_instr(const char *lvl, struct pt_regs *regs)
@@ -146,6 +157,13 @@ void dump_backtrace(struct pt_regs *regs, struct task_struct *tsk)
 {
 	struct stackframe frame;
 	int skip = 0;
+	long cur_state = 0;
+	unsigned long cur_sp = 0;
+	unsigned long cur_fp = 0;
+
+#ifdef CONFIG_SEC_DEBUG
+	unsigned long prev_fp = 0;
+#endif
 
 	pr_debug("%s(regs = %p tsk = %p)\n", __func__, regs, tsk);
 
@@ -170,16 +188,33 @@ void dump_backtrace(struct pt_regs *regs, struct task_struct *tsk)
 		 */
 		frame.fp = thread_saved_fp(tsk);
 		frame.pc = thread_saved_pc(tsk);
+		cur_state = tsk->state;
+		cur_sp = thread_saved_sp(tsk);
+		cur_fp = frame.fp;
 	}
 #ifdef CONFIG_FUNCTION_GRAPH_TRACER
 	frame.graph = tsk->curr_ret_stack;
 #endif
 
 	printk("Call trace:\n");
-	while (1) {
-		unsigned long stack;
-		int ret;
-
+	do {
+		if (tsk != current && (cur_state != tsk->state
+			/*
+			 * We would not be printing backtrace for the task
+			 * that has changed state from uninterruptible to
+			 * running before hitting the do-while loop but after
+			 * saving the current state. If task is in running
+			 * state before saving the state, then we may print
+			 * wrong call trace or end up in infinite while loop
+			 * if *(fp) and *(fp+8) are same. While the situation
+			 * will stop print when that task schedule out.
+			 */
+			|| cur_sp != thread_saved_sp(tsk)
+			|| cur_fp != thread_saved_fp(tsk))) {
+			printk("The task:%s had been rescheduled!\n",
+				tsk->comm);
+			break;
+		}
 		/* skip until specified stack frame */
 		if (!skip) {
 			dump_backtrace_entry(frame.pc);
@@ -194,17 +229,21 @@ void dump_backtrace(struct pt_regs *regs, struct task_struct *tsk)
 			 */
 			dump_backtrace_entry(regs->pc);
 		}
-		ret = unwind_frame(tsk, &frame);
-		if (ret < 0)
-			break;
-		if (in_entry_text(frame.pc)) {
-			stack = frame.fp - offsetof(struct pt_regs, stackframe);
 
-			if (on_accessible_stack(tsk, stack))
-				dump_mem("", "Exception stack", stack,
-					 stack + sizeof(struct pt_regs));
+#ifdef CONFIG_SEC_DEBUG
+		if (prev_fp >= frame.fp) {
+			if (on_accessible_stack(tsk, frame.fp)) {
+				printk("FP looks invalid : "
+					"0x%016lx state(0x%016lx) "
+					"on_cpu(%d)@cpu%u\n",
+					frame.fp, tsk->state,
+					tsk->on_cpu, tsk->cpu);
+			}
+			break;
 		}
-	}
+		prev_fp = frame.fp;
+#endif
+	} while (!unwind_frame(tsk, &frame));
 
 	put_task_stack(tsk);
 }
@@ -242,8 +281,23 @@ static int __die(const char *str, int err, struct pt_regs *regs)
 		 end_of_stack(tsk));
 	show_regs(regs);
 
-	if (!user_mode(regs))
+	if (!user_mode(regs)) {
+#ifdef CONFIG_SEC_DEBUG
+		unsigned long bottom = regs->sp;
+		if (!object_is_on_stack((void *)bottom)) {
+			unsigned long irq_stack =
+				(unsigned long)this_cpu_read(irq_stack_ptr);
+			if ((irq_stack <= bottom) &&
+			    (bottom < irq_stack + IRQ_STACK_SIZE))
+				dump_mem(KERN_EMERG, "Stack: ", bottom,
+					 irq_stack + IRQ_STACK_SIZE);
+			bottom = (unsigned long)task_stack_page(tsk);
+		}
+		dump_mem(KERN_EMERG, "Stack: ", bottom,
+			 THREAD_SIZE + (unsigned long)task_stack_page(tsk));
+#endif
 		dump_instr(KERN_EMERG, regs);
+	}
 
 	return ret;
 }
@@ -261,6 +315,9 @@ void die(const char *str, struct pt_regs *regs, int err)
 	raw_spin_lock_irqsave(&die_lock, flags);
 
 	oops_enter();
+
+	sec_debug_sched_msg("!!die!!");
+	sec_debug_summary_save_die_info(str, regs);
 
 	console_verbose();
 	bust_spinlocks(1);
@@ -337,10 +394,12 @@ static int call_undef_hook(struct pt_regs *regs)
 	int (*fn)(struct pt_regs *regs, u32 instr) = NULL;
 	void __user *pc = (void __user *)instruction_pointer(regs);
 
-	if (!user_mode(regs))
-		return 1;
-
-	if (compat_thumb_mode(regs)) {
+	if (!user_mode(regs)) {
+		__le32 instr_le;
+		if (probe_kernel_address((__force __le32 *)pc, instr_le))
+			goto exit;
+		instr = le32_to_cpu(instr_le);
+	} else if (compat_thumb_mode(regs)) {
 		/* 16-bit Thumb instruction */
 		__le16 instr_le;
 		if (get_user(instr_le, (__le16 __user *)pc))
@@ -426,6 +485,8 @@ void arm64_notify_segfault(struct pt_regs *regs, unsigned long addr)
 
 asmlinkage void __exception do_undefinstr(struct pt_regs *regs)
 {
+	void __user *pc = (void __user *)instruction_pointer(regs);
+
 	/* check for AArch32 breakpoint instructions */
 	if (!aarch32_break_handler(regs))
 		return;
@@ -433,7 +494,10 @@ asmlinkage void __exception do_undefinstr(struct pt_regs *regs)
 	if (call_undef_hook(regs) == 0)
 		return;
 
+	trace_undef_instr(regs, pc);
+
 	force_signal_inject(SIGILL, ILL_ILLOPC, regs, 0);
+	BUG_ON(!user_mode(regs));
 }
 
 int cpu_enable_cache_maint_trap(void *__unused)
@@ -512,6 +576,7 @@ static void cntvct_read_handler(unsigned int esr, struct pt_regs *regs)
 {
 	int rt = (esr & ESR_ELx_SYS64_ISS_RT_MASK) >> ESR_ELx_SYS64_ISS_RT_SHIFT;
 
+	isb();
 	pt_regs_write_reg(regs, rt, arch_counter_get_cntvct());
 	arm64_skip_faulting_instruction(regs, AARCH64_INSN_SIZE);
 }
@@ -575,6 +640,124 @@ asmlinkage void __exception do_sysinstr(unsigned int esr, struct pt_regs *regs)
 	do_undefinstr(regs);
 }
 
+#ifdef CONFIG_COMPAT
+static void cntfrq_cp15_32_read_handler(unsigned int esr, struct pt_regs *regs)
+{
+	int rt =
+	  (esr & ESR_ELx_CP15_32_ISS_RT_MASK) >> ESR_ELx_CP15_32_ISS_RT_SHIFT;
+	int cv =
+	  (esr & ESR_ELx_CP15_32_ISS_CV_MASK) >> ESR_ELx_CP15_32_ISS_CV_SHIFT;
+	int cond =
+	  (esr & ESR_ELx_CP15_32_ISS_COND_MASK) >>
+		ESR_ELx_CP15_32_ISS_COND_SHIFT;
+	bool read_reg = 1;
+
+	if (rt == 13 && !compat_arm_instr_set(regs))
+		read_reg = 0;
+
+	if (cv && cond != 0xf &&
+	    !(*aarch32_opcode_cond_checks[cond])(regs->pstate & 0xffffffff))
+		read_reg = 0;
+
+	if (read_reg)
+		regs->regs[rt] = read_sysreg(cntfrq_el0);
+	regs->pc += 4;
+}
+
+struct cp15_32_hook {
+	unsigned int esr_mask;
+	unsigned int esr_val;
+	void (*handler)(unsigned int esr, struct pt_regs *regs);
+};
+
+static struct cp15_32_hook cp15_32_hooks[] = {
+	{
+		/* Trap CP15 AArch32 read access to CNTFRQ_EL0 */
+		.esr_mask = ESR_ELx_CP15_32_ISS_SYS_OP_MASK,
+		.esr_val = ESR_ELx_CP15_32_ISS_SYS_CNTFRQ,
+		.handler = cntfrq_cp15_32_read_handler,
+	},
+	{},
+};
+
+asmlinkage void __exception do_cp15_32_instr_compat(unsigned int esr,
+						    struct pt_regs *regs)
+{
+	struct cp15_32_hook *hook;
+
+	for (hook = cp15_32_hooks; hook->handler; hook++)
+		if ((hook->esr_mask & esr) == hook->esr_val) {
+			hook->handler(esr, regs);
+			return;
+		}
+
+	force_signal_inject(SIGILL, ILL_ILLOPC, regs, 0);
+}
+
+static void cntvct_cp15_64_read_handler(unsigned int esr, struct pt_regs *regs)
+{
+	int rt =
+	  (esr & ESR_ELx_CP15_64_ISS_RT_MASK) >> ESR_ELx_CP15_64_ISS_RT_SHIFT;
+	int rt2 =
+	  (esr & ESR_ELx_CP15_64_ISS_RT2_MASK) >> ESR_ELx_CP15_64_ISS_RT2_SHIFT;
+	int cv =
+	  (esr & ESR_ELx_CP15_64_ISS_CV_MASK) >> ESR_ELx_CP15_64_ISS_CV_SHIFT;
+	int cond =
+	  (esr & ESR_ELx_CP15_64_ISS_COND_MASK) >>
+		ESR_ELx_CP15_64_ISS_COND_SHIFT;
+	bool read_reg = 1;
+
+	if (rt == 15 || rt2 == 15 || rt == rt2)
+		read_reg = 0;
+
+	if ((rt == 13 || rt2 == 13) && !compat_arm_instr_set(regs))
+		read_reg = 0;
+
+	if (cv && cond != 0xf &&
+	    !(*aarch32_opcode_cond_checks[cond])(regs->pstate & 0xffffffff))
+		read_reg = 0;
+
+	if (read_reg) {
+		u64 cval =  arch_counter_get_cntvct();
+
+		regs->regs[rt] = cval & 0xffffffff;
+		regs->regs[rt2] = cval >> 32;
+	}
+	regs->pc += 4;
+}
+
+struct cp15_64_hook {
+	unsigned int esr_mask;
+	unsigned int esr_val;
+	void (*handler)(unsigned int esr, struct pt_regs *regs);
+};
+
+static struct cp15_64_hook cp15_64_hooks[] = {
+	{
+		/* Trap CP15 AArch32 read access to CNTVCT_EL0 */
+		.esr_mask = ESR_ELx_CP15_64_ISS_SYS_OP_MASK,
+		.esr_val = ESR_ELx_CP15_64_ISS_SYS_CNTVCT,
+		.handler = cntvct_cp15_64_read_handler,
+	},
+	{},
+};
+
+asmlinkage void __exception do_cp15_64_instr_compat(unsigned int esr,
+						    struct pt_regs *regs)
+{
+	struct cp15_64_hook *hook;
+
+	for (hook = cp15_64_hooks; hook->handler; hook++)
+		if ((hook->esr_mask & esr) == hook->esr_val) {
+			hook->handler(esr, regs);
+			return;
+		}
+
+	force_signal_inject(SIGILL, ILL_ILLOPC, regs, 0);
+}
+
+#endif
+
 long compat_arm_syscall(struct pt_regs *regs);
 
 asmlinkage long do_ni_syscall(struct pt_regs *regs)
@@ -610,6 +793,7 @@ static const char *esr_class_str[] = {
 	[ESR_ELx_EC_HVC64]		= "HVC (AArch64)",
 	[ESR_ELx_EC_SMC64]		= "SMC (AArch64)",
 	[ESR_ELx_EC_SYS64]		= "MSR/MRS (AArch64)",
+	[ESR_ELx_EC_SVE]		= "SVE",
 	[ESR_ELx_EC_IMP_DEF]		= "EL3 IMP DEF",
 	[ESR_ELx_EC_IABT_LOW]		= "IABT (lower EL)",
 	[ESR_ELx_EC_IABT_CUR]		= "IABT (current EL)",
@@ -643,6 +827,11 @@ const char *esr_get_class_string(u32 esr)
 asmlinkage void bad_mode(struct pt_regs *regs, int reason, unsigned int esr)
 {
 	console_verbose();
+
+#ifdef CONFIG_SEC_USER_RESET_DEBUG
+	sec_debug_save_badmode_info(reason, handler[reason],
+			esr, esr_get_class_string(esr));
+#endif
 
 	pr_crit("Bad mode in %s handler detected on CPU%d, code 0x%08x -- %s\n",
 		handler[reason], smp_processor_id(), esr,

@@ -43,6 +43,8 @@
 #include "blk-mq-sched.h"
 #include "blk-wbt.h"
 
+#include <linux/math64.h>
+
 #ifdef CONFIG_DEBUG_FS
 struct dentry *blk_debugfs_root;
 #endif
@@ -457,7 +459,7 @@ EXPORT_SYMBOL(blk_put_queue);
  * If not, only ELVPRIV requests are drained.  The caller is responsible
  * for ensuring that no new requests which need to be drained are queued.
  */
-static void __blk_drain_queue(struct request_queue *q, bool drain_all)
+void __blk_drain_queue(struct request_queue *q, bool drain_all)
 	__releases(q->queue_lock)
 	__acquires(q->queue_lock)
 {
@@ -1429,6 +1431,9 @@ static struct request *blk_old_get_request(struct request_queue *q,
 	/* q->queue_lock is unlocked at this point */
 	rq->__data_len = 0;
 	rq->__sector = (sector_t) -1;
+#ifdef CONFIG_BLK_DEV_CRYPT_DUN
+	rq->__dun = 0;
+#endif
 	rq->bio = rq->biotail = NULL;
 	return rq;
 }
@@ -1652,6 +1657,9 @@ bool bio_attempt_front_merge(struct request_queue *q, struct request *req,
 	bio->bi_next = req->bio;
 	req->bio = bio;
 
+#ifdef CONFIG_BLK_DEV_CRYPT_DUN
+	req->__dun = bio->bi_iter.bi_dun;
+#endif
 	req->__sector = bio->bi_iter.bi_sector;
 	req->__data_len += bio->bi_iter.bi_size;
 	req->ioprio = ioprio_best(req->ioprio, bio_prio(bio));
@@ -1794,6 +1802,9 @@ void blk_init_request_from_bio(struct request *req, struct bio *bio)
 		req->cmd_flags |= REQ_FAILFAST_MASK;
 
 	req->__sector = bio->bi_iter.bi_sector;
+#ifdef CONFIG_BLK_DEV_CRYPT_DUN
+	req->__dun = bio->bi_iter.bi_dun;
+#endif
 	if (ioprio_valid(bio_prio(bio)))
 		req->ioprio = bio_prio(bio);
 	else if (ioc)
@@ -2001,7 +2012,8 @@ static inline int blk_partition_remap(struct bio *bio)
 		trace_block_bio_remap(bio->bi_disk->queue, bio, part_devt(p),
 				bio->bi_iter.bi_sector - p->start_sect);
 	} else {
-		printk("%s: fail for partition %d\n", __func__, bio->bi_partno);
+		printk_ratelimited("%s: fail for partition %d\n",
+			__func__, bio->bi_partno);
 		ret = -EIO;
 	}
 	rcu_read_unlock();
@@ -2053,7 +2065,7 @@ generic_make_request_checks(struct bio *bio)
 
 	q = bio->bi_disk->queue;
 	if (unlikely(!q)) {
-		printk(KERN_ERR
+		printk_ratelimited(KERN_ERR
 		       "generic_make_request: Trying to access "
 			"nonexistent block-device %s (%Lu)\n",
 			bio_devname(bio, b), (long long)bio->bi_iter.bi_sector);
@@ -2447,6 +2459,8 @@ void blk_account_io_completion(struct request *req, unsigned int bytes)
 		cpu = part_stat_lock();
 		part = req->part;
 		part_stat_add(cpu, part, sectors[rw], bytes >> 9);
+		if (req_op(req) == REQ_OP_DISCARD)
+			part_stat_add(cpu, part, discard_sectors, bytes >> 9);
 		part_stat_unlock();
 	}
 }
@@ -2471,10 +2485,18 @@ void blk_account_io_done(struct request *req)
 		part_stat_add(cpu, part, ticks[rw], duration);
 		part_round_stats(req->q, cpu, part);
 		part_dec_in_flight(req->q, part, rw);
+		if (req_op(req) == REQ_OP_DISCARD)
+			part_stat_inc(cpu, part, discard_ios);
+		if (!(req->rq_flags & RQF_STARTED))
+			part_stat_inc(cpu, part, flush_ios);
 
 		hd_struct_put(part);
 		part_stat_unlock();
 	}
+
+	if (req->rq_flags & RQF_FLUSH_SEQ)
+		req->q->flush_ios++;
+
 }
 
 #ifdef CONFIG_PM
@@ -2632,7 +2654,8 @@ struct request *blk_peek_request(struct request_queue *q)
 			__blk_end_request_all(rq, ret == BLKPREP_INVALID ?
 					BLK_STS_TARGET : BLK_STS_IOERR);
 		} else {
-			printk(KERN_ERR "%s: bad return=%d\n", __func__, ret);
+			printk_ratelimited(KERN_ERR "%s: bad return=%d\n",
+				__func__, ret);
 			break;
 		}
 	}
@@ -2656,6 +2679,8 @@ static void blk_dequeue_request(struct request *rq)
 	 * the driver side.
 	 */
 	if (blk_account_rq(rq)) {
+		if (!queue_in_flight(q))
+			q->in_flight_stamp = ktime_get();
 		q->in_flight[rq_is_sync(rq)]++;
 		set_io_start_time_ns(rq);
 	}
@@ -2786,8 +2811,13 @@ bool blk_update_request(struct request *req, blk_status_t error,
 	req->__data_len -= total_bytes;
 
 	/* update sector only for requests with clear definition of sector */
-	if (!blk_rq_is_passthrough(req))
+	if (!blk_rq_is_passthrough(req)) {
 		req->__sector += total_bytes >> 9;
+#ifdef CONFIG_BLK_DEV_CRYPT_DUN
+		if (req->__dun)
+			req->__dun += total_bytes >> 12;
+#endif
+	}
 
 	/* mixed attributes always follow the first bio */
 	if (req->rq_flags & RQF_MIXED_MERGE) {
@@ -3150,6 +3180,9 @@ static void __blk_rq_prep_clone(struct request *dst, struct request *src)
 {
 	dst->cpu = src->cpu;
 	dst->__sector = blk_rq_pos(src);
+#ifdef CONFIG_BLK_DEV_CRYPT_DUN
+	dst->__dun = blk_rq_dun(src);
+#endif
 	dst->__data_len = blk_rq_bytes(src);
 	if (src->rq_flags & RQF_SPECIAL_PAYLOAD) {
 		dst->rq_flags |= RQF_SPECIAL_PAYLOAD;
@@ -3623,6 +3656,73 @@ void blk_set_runtime_active(struct request_queue *q)
 EXPORT_SYMBOL(blk_set_runtime_active);
 #endif
 
+/* IOPP-sio-v1.0.4.4 */
+#if !defined(CONFIG_SAMSUNG_PRODUCT_SHIP)
+/*********************************
+ * debugfs functions
+ **********************************/
+#ifdef CONFIG_DEBUG_FS
+#include <linux/debugfs.h>
+
+#define DBGFS_FUNC_DECL(name) \
+static int sio_open_##name(struct inode *inode, struct file *file) \
+{ \
+	return single_open(file, sio_show_##name, inode->i_private); \
+} \
+static const struct file_operations sio_fops_##name = { \
+	.owner		= THIS_MODULE, \
+	.open		= sio_open_##name, \
+	.llseek		= seq_lseek, \
+	.read		= seq_read, \
+	.release	= single_release, \
+}
+
+static int sio_show_patches(struct seq_file *s, void *p)
+{
+	extern char *__start_sio_patches;
+	extern char *__stop_sio_patches;
+	char **p_version_str;
+
+	for (p_version_str = &__start_sio_patches; p_version_str < &__stop_sio_patches; ++p_version_str)
+		seq_printf(s, "%s\n", *p_version_str);
+
+	return 0;
+}
+
+static struct dentry *sio_debugfs_root;
+
+DBGFS_FUNC_DECL(patches);
+
+SIO_PATCH_VERSION(SIO_patch_manager, 1, 0, "");
+
+static int __init sio_debugfs_init(void)
+{
+	if (!debugfs_initialized())
+		return -ENODEV;
+
+	sio_debugfs_root = debugfs_create_dir("sio", NULL);
+	if (!sio_debugfs_root)
+		return -ENOMEM;
+
+	debugfs_create_file("patches", 0400, sio_debugfs_root, NULL, &sio_fops_patches);
+
+	return 0;
+}
+
+static void __exit sio_debugfs_exit(void)
+{
+	debugfs_remove_recursive(sio_debugfs_root);
+}
+#else
+static int __init sio_debugfs_init(void)
+{
+	return 0;
+}
+
+static void __exit sio_debugfs_exit(void) { }
+#endif
+#endif
+
 int __init blk_dev_init(void)
 {
 	BUILD_BUG_ON(REQ_OP_LAST >= (1 << REQ_OP_BITS));
@@ -3647,5 +3747,91 @@ int __init blk_dev_init(void)
 	blk_debugfs_root = debugfs_create_dir("block", NULL);
 #endif
 
+#if !defined(CONFIG_SAMSUNG_PRODUCT_SHIP)
+	sio_debugfs_init();
+#endif
+
 	return 0;
 }
+
+/*
+ * Blk IO latency support. We want this to be as cheap as possible, so doing
+ * this lockless (and avoiding atomics), a few off by a few errors in this
+ * code is not harmful, and we don't want to do anything that is
+ * perf-impactful.
+ * TODO : If necessary, we can make the histograms per-cpu and aggregate
+ * them when printing them out.
+ */
+void
+blk_zero_latency_hist(struct io_latency_state *s)
+{
+	memset(s->latency_y_axis_read, 0,
+	       sizeof(s->latency_y_axis_read));
+	memset(s->latency_y_axis_write, 0,
+	       sizeof(s->latency_y_axis_write));
+	s->latency_reads_elems = 0;
+	s->latency_writes_elems = 0;
+}
+EXPORT_SYMBOL(blk_zero_latency_hist);
+
+ssize_t
+blk_latency_hist_show(struct io_latency_state *s, char *buf)
+{
+	int i;
+	int bytes_written = 0;
+	u_int64_t num_elem, elem;
+	int pct;
+
+	num_elem = s->latency_reads_elems;
+	if (num_elem > 0) {
+		bytes_written += scnprintf(buf + bytes_written,
+			   PAGE_SIZE - bytes_written,
+			   "IO svc_time Read Latency Histogram (n = %llu):\n",
+			   num_elem);
+		for (i = 0;
+		     i < ARRAY_SIZE(latency_x_axis_us);
+		     i++) {
+			elem = s->latency_y_axis_read[i];
+			pct = div64_u64(elem * 100, num_elem);
+			bytes_written += scnprintf(buf + bytes_written,
+						   PAGE_SIZE - bytes_written,
+						   "\t< %5lluus%15llu%15d%%\n",
+						   latency_x_axis_us[i],
+						   elem, pct);
+		}
+		/* Last element in y-axis table is overflow */
+		elem = s->latency_y_axis_read[i];
+		pct = div64_u64(elem * 100, num_elem);
+		bytes_written += scnprintf(buf + bytes_written,
+					   PAGE_SIZE - bytes_written,
+					   "\t> %5dms%15llu%15d%%\n", 10,
+					   elem, pct);
+	}
+	num_elem = s->latency_writes_elems;
+	if (num_elem > 0) {
+		bytes_written += scnprintf(buf + bytes_written,
+			   PAGE_SIZE - bytes_written,
+			   "IO svc_time Write Latency Histogram (n = %llu):\n",
+			   num_elem);
+		for (i = 0;
+		     i < ARRAY_SIZE(latency_x_axis_us);
+		     i++) {
+			elem = s->latency_y_axis_write[i];
+			pct = div64_u64(elem * 100, num_elem);
+			bytes_written += scnprintf(buf + bytes_written,
+						   PAGE_SIZE - bytes_written,
+						   "\t< %5lluus%15llu%15d%%\n",
+						   latency_x_axis_us[i],
+						   elem, pct);
+		}
+		/* Last element in y-axis table is overflow */
+		elem = s->latency_y_axis_write[i];
+		pct = div64_u64(elem * 100, num_elem);
+		bytes_written += scnprintf(buf + bytes_written,
+					   PAGE_SIZE - bytes_written,
+					   "\t> %5dms%15llu%15d%%\n", 10,
+					   elem, pct);
+	}
+	return bytes_written;
+}
+EXPORT_SYMBOL(blk_latency_hist_show);

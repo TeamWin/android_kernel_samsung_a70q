@@ -175,7 +175,7 @@ static inline int ovl_do_whiteout(struct inode *dir, struct dentry *dentry)
 
 static inline struct dentry *ovl_do_tmpfile(struct dentry *dentry, umode_t mode)
 {
-	struct dentry *ret = vfs_tmpfile(dentry, mode, 0);
+	struct dentry *ret = vfs_tmpfile(NULL, dentry, mode, 0);
 	int err = IS_ERR(ret) ? PTR_ERR(ret) : 0;
 
 	pr_debug("tmpfile(%pd2, 0%o) = %i\n", dentry, mode, err);
@@ -187,6 +187,7 @@ int ovl_want_write(struct dentry *dentry);
 void ovl_drop_write(struct dentry *dentry);
 struct dentry *ovl_workdir(struct dentry *dentry);
 const struct cred *ovl_override_creds(struct super_block *sb);
+void ovl_revert_creds(const struct cred *oldcred);
 struct super_block *ovl_same_sb(struct super_block *sb);
 bool ovl_can_decode_fh(struct super_block *sb);
 struct dentry *ovl_indexdir(struct super_block *sb);

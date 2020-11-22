@@ -614,6 +614,13 @@ void mark_buffer_dirty_inode(struct buffer_head *bh, struct inode *inode)
 }
 EXPORT_SYMBOL(mark_buffer_dirty_inode);
 
+void mark_buffer_dirty_inode_sync(struct buffer_head *bh, struct inode *inode)
+{
+	set_buffer_sync_flush(bh);
+	mark_buffer_dirty_inode(bh, inode);
+}
+EXPORT_SYMBOL(mark_buffer_dirty_inode_sync);
+
 /*
  * Mark the page dirty, and set it dirty in the radix tree, and mark the inode
  * dirty.
@@ -1179,6 +1186,42 @@ void mark_buffer_dirty(struct buffer_head *bh)
 }
 EXPORT_SYMBOL(mark_buffer_dirty);
 
+void mark_buffer_dirty_sync(struct buffer_head *bh)
+{
+	WARN_ON_ONCE(!buffer_uptodate(bh));
+
+	trace_block_dirty_buffer(bh);
+
+	/*
+	 * Very *carefully* optimize the it-is-already-dirty case.
+	 *
+	 * Don't let the final "is it dirty" escape to before we
+	 * perhaps modified the buffer.
+	 */
+	if (buffer_dirty(bh)) {
+		smp_mb();
+		if (buffer_dirty(bh))
+			return;
+	}
+
+	set_buffer_sync_flush(bh);
+	if (!test_set_buffer_dirty(bh)) {
+		struct page *page = bh->b_page;
+		struct address_space *mapping = NULL;
+
+		lock_page_memcg(page);
+		if (!TestSetPageDirty(page)) {
+			mapping = page_mapping(page);
+			if (mapping)
+				__set_page_dirty(page, mapping, 0);
+		}
+		unlock_page_memcg(page);
+		if (mapping)
+			__mark_inode_dirty(mapping->host, I_DIRTY_PAGES);
+	}
+}
+EXPORT_SYMBOL(mark_buffer_dirty_sync);
+
 void mark_buffer_write_io_error(struct buffer_head *bh)
 {
 	set_buffer_write_io_error(bh);
@@ -1273,6 +1316,8 @@ static DEFINE_PER_CPU(struct bh_lru, bh_lrus) = {{ NULL }};
 #define bh_lru_lock()	preempt_disable()
 #define bh_lru_unlock()	preempt_enable()
 #endif
+#define __FS_HAS_ENCRYPTION IS_ENABLED(CONFIG_FS_ENCRYPTION)
+#include <linux/fscrypt.h>
 
 static inline void check_irqs_on(void)
 {
@@ -1452,11 +1497,47 @@ static bool has_bh_in_lru(int cpu, void *dummy)
 	return 0;
 }
 
+static void __evict_bh_lru(void *arg)
+{
+	struct bh_lru *b = &get_cpu_var(bh_lrus);
+	struct buffer_head *bh = arg;
+	int i;
+
+	for (i = 0; i < BH_LRU_SIZE; i++) {
+		if (b->bhs[i] == bh) {
+			brelse(b->bhs[i]);
+			b->bhs[i] = NULL;
+			goto out;
+		}
+	}
+out:
+	put_cpu_var(bh_lrus);
+}
+
+static bool bh_exists_in_lru(int cpu, void *arg)
+{
+	struct bh_lru *b = per_cpu_ptr(&bh_lrus, cpu);
+	struct buffer_head *bh = arg;
+	int i;
+
+	for (i = 0; i < BH_LRU_SIZE; i++) {
+		if (b->bhs[i] == bh)
+			return 1;
+	}
+
+	return 0;
+
+}
 void invalidate_bh_lrus(void)
 {
 	on_each_cpu_cond(has_bh_in_lru, invalidate_bh_lru, NULL, 1, GFP_KERNEL);
 }
 EXPORT_SYMBOL_GPL(invalidate_bh_lrus);
+
+static void evict_bh_lrus(struct buffer_head *bh)
+{
+	on_each_cpu_cond(bh_exists_in_lru, __evict_bh_lru, bh, 1, GFP_ATOMIC);
+}
 
 void set_bh_page(struct buffer_head *bh,
 		struct page *page, unsigned long offset)
@@ -3147,8 +3228,19 @@ static int submit_bh_wbc(int op, int op_flags, struct buffer_head *bh,
 		op_flags |= REQ_META;
 	if (buffer_prio(bh))
 		op_flags |= REQ_PRIO;
+	if (buffer_sync_flush(bh)) {
+		op_flags |= REQ_SYNC;
+		clear_buffer_sync_flush(bh);
+	}
 	bio_set_op_attrs(bio, op, op_flags);
 
+#ifdef CONFIG_FS_INLINE_ENCRYPTION
+#if defined(CONFIG_CRYPTO_DISKCIPHER_DEBUG)
+	crypto_diskcipher_debug(BLK_BH, op_flags);
+#endif
+	if (bio->bi_opf & REQ_CRYPT)
+		bio->bi_cryptd = bh->b_private;
+#endif
 	submit_bio(bio);
 	return 0;
 }
@@ -3292,8 +3384,15 @@ drop_buffers(struct page *page, struct buffer_head **buffers_to_free)
 
 	bh = head;
 	do {
-		if (buffer_busy(bh))
-			goto failed;
+		if (buffer_busy(bh)) {
+			/*
+			 * Check if the busy failure was due to an
+			 * outstanding LRU reference
+			 */
+			evict_bh_lrus(bh);
+			if (buffer_busy(bh))
+				goto failed;
+		}
 		bh = bh->b_this_page;
 	} while (bh != head);
 
@@ -3502,6 +3601,35 @@ int bh_submit_read(struct buffer_head *bh)
 	return -EIO;
 }
 EXPORT_SYMBOL(bh_submit_read);
+
+/**
+ * bh_submit_read - Submit a locked buffer for reading
+ * @bh: struct buffer_head
+ *
+ * Returns zero on success and -EIO on error.
+ */
+int bh_submit_read_fbe(struct inode *inode, struct buffer_head *bh)
+{
+	BUG_ON(!buffer_locked(bh));
+
+	if (buffer_uptodate(bh)) {
+		unlock_buffer(bh);
+		return 0;
+	}
+	get_bh(bh);
+	bh->b_end_io = end_buffer_read_sync;
+
+	bh->b_private = fscrypt_get_bio_cryptd(inode);
+	submit_bh(REQ_OP_READ, bh->b_private?REQ_CRYPT:0, bh);
+
+	/* Restore bh->b_private */
+	bh->b_private = NULL;
+	wait_on_buffer(bh);
+	if (buffer_uptodate(bh))
+		return 0;
+	return -EIO;
+}
+EXPORT_SYMBOL(bh_submit_read_fbe);
 
 /*
  * Seek for SEEK_DATA / SEEK_HOLE within @page, starting at @lastoff.

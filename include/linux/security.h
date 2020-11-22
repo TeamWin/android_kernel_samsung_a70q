@@ -31,6 +31,7 @@
 #include <linux/string.h>
 #include <linux/mm.h>
 #include <linux/fs.h>
+#include <linux/bio.h>
 
 struct linux_binprm;
 struct cred;
@@ -68,6 +69,34 @@ struct ctl_table;
 struct audit_krule;
 struct user_namespace;
 struct timezone;
+
+#ifdef CONFIG_RKP_KDP
+#define rocred_uc_read(x) atomic_read(x->use_cnt)
+#define rocred_uc_inc(x)  atomic_inc(x->use_cnt)
+#define rocred_uc_dec_and_test(x) atomic_dec_and_test(x->use_cnt)
+#define rocred_uc_inc_not_zero(x) atomic_inc_not_zero(x->use_cnt)
+#define rocred_uc_set(x,v) atomic_set(x->use_cnt,v)
+
+extern int rkp_cred_enable;
+extern char __rkp_ro_start[], __rkp_ro_end[];
+extern struct cred init_cred;
+extern struct task_security_struct init_sec;
+/*Check whether the address belong to Cred Area*/
+static inline u8 rkp_ro_page(unsigned long addr)
+{
+	if(!rkp_cred_enable)
+		return (u8)0;
+	if((addr == ((unsigned long)&init_cred)) || 
+		(addr == ((unsigned long)&init_sec)))
+		return (u8)1;
+	else
+		return rkp_is_pg_protected(addr);
+}
+extern int security_integrity_current(void);
+
+#else
+#define security_integrity_current()  0
+#endif
 
 enum lsm_event {
 	LSM_POLICY_CHANGE,
@@ -270,6 +299,8 @@ int security_old_inode_init_security(struct inode *inode, struct inode *dir,
 				     const struct qstr *qstr, const char **name,
 				     void **value, size_t *len);
 int security_inode_create(struct inode *dir, struct dentry *dentry, umode_t mode);
+int security_inode_post_create(struct inode *dir, struct dentry *dentry,
+					umode_t mode);
 int security_inode_link(struct dentry *old_dentry, struct inode *dir,
 			 struct dentry *new_dentry);
 int security_inode_unlink(struct inode *dir, struct dentry *dentry);
@@ -658,6 +689,13 @@ static inline int security_old_inode_init_security(struct inode *inode,
 }
 
 static inline int security_inode_create(struct inode *dir,
+					 struct dentry *dentry,
+					 umode_t mode)
+{
+	return 0;
+}
+
+static inline int security_inode_post_create(struct inode *dir,
 					 struct dentry *dentry,
 					 umode_t mode)
 {
@@ -1729,6 +1767,54 @@ static inline void securityfs_remove(struct dentry *dentry)
 {}
 
 #endif
+
+#ifdef CONFIG_BPF_SYSCALL
+union bpf_attr;
+struct bpf_map;
+struct bpf_prog;
+struct bpf_prog_aux;
+#ifdef CONFIG_SECURITY
+extern int security_bpf(int cmd, union bpf_attr *attr, unsigned int size);
+extern int security_bpf_map(struct bpf_map *map, fmode_t fmode);
+extern int security_bpf_prog(struct bpf_prog *prog);
+extern int security_bpf_map_alloc(struct bpf_map *map);
+extern void security_bpf_map_free(struct bpf_map *map);
+extern int security_bpf_prog_alloc(struct bpf_prog_aux *aux);
+extern void security_bpf_prog_free(struct bpf_prog_aux *aux);
+#else
+static inline int security_bpf(int cmd, union bpf_attr *attr,
+					     unsigned int size)
+{
+	return 0;
+}
+
+static inline int security_bpf_map(struct bpf_map *map, fmode_t fmode)
+{
+	return 0;
+}
+
+static inline int security_bpf_prog(struct bpf_prog *prog)
+{
+	return 0;
+}
+
+static inline int security_bpf_map_alloc(struct bpf_map *map)
+{
+	return 0;
+}
+
+static inline void security_bpf_map_free(struct bpf_map *map)
+{ }
+
+static inline int security_bpf_prog_alloc(struct bpf_prog_aux *aux)
+{
+	return 0;
+}
+
+static inline void security_bpf_prog_free(struct bpf_prog_aux *aux)
+{ }
+#endif /* CONFIG_SECURITY */
+#endif /* CONFIG_BPF_SYSCALL */
 
 #ifdef CONFIG_SECURITY
 

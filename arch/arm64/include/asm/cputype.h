@@ -85,6 +85,12 @@
 #define ARM_CPU_PART_CORTEX_A53		0xD03
 #define ARM_CPU_PART_CORTEX_A73		0xD09
 #define ARM_CPU_PART_CORTEX_A75		0xD0A
+#define ARM_CPU_PART_CORTEX_A76		0xD0B
+#define ARM_CPU_PART_KRYO3S		0x803
+#define ARM_CPU_PART_KRYO4S		0x803
+#define ARM_CPU_PART_KRYO4G		0x804
+#define ARM_CPU_PART_KRYO2XX_GOLD	0x800
+#define ARM_CPU_PART_KRYO2XX_SILVER	0x801
 
 #define APM_CPU_PART_POTENZA		0x000
 
@@ -108,6 +114,10 @@
 #define MIDR_CORTEX_A72 MIDR_CPU_MODEL(ARM_CPU_IMP_ARM, ARM_CPU_PART_CORTEX_A72)
 #define MIDR_CORTEX_A73 MIDR_CPU_MODEL(ARM_CPU_IMP_ARM, ARM_CPU_PART_CORTEX_A73)
 #define MIDR_CORTEX_A75 MIDR_CPU_MODEL(ARM_CPU_IMP_ARM, ARM_CPU_PART_CORTEX_A75)
+#define MIDR_CORTEX_A76 MIDR_CPU_MODEL(ARM_CPU_IMP_ARM, ARM_CPU_PART_CORTEX_A76)
+#define MIDR_KRYO3S	MIDR_CPU_MODEL(ARM_CPU_IMP_QCOM, ARM_CPU_PART_KRYO3S)
+#define MIDR_KRYO4S	MIDR_CPU_MODEL(ARM_CPU_IMP_QCOM, ARM_CPU_PART_KRYO4S)
+#define MIDR_KRYO4G	MIDR_CPU_MODEL(ARM_CPU_IMP_QCOM, ARM_CPU_PART_KRYO4G)
 #define MIDR_THUNDERX	MIDR_CPU_MODEL(ARM_CPU_IMP_CAVIUM, CAVIUM_CPU_PART_THUNDERX)
 #define MIDR_THUNDERX_81XX MIDR_CPU_MODEL(ARM_CPU_IMP_CAVIUM, CAVIUM_CPU_PART_THUNDERX_81XX)
 #define MIDR_THUNDERX_83XX MIDR_CPU_MODEL(ARM_CPU_IMP_CAVIUM, CAVIUM_CPU_PART_THUNDERX_83XX)
@@ -118,12 +128,55 @@
 #define MIDR_QCOM_KRYO MIDR_CPU_MODEL(ARM_CPU_IMP_QCOM, QCOM_CPU_PART_KRYO)
 #define MIDR_NVIDIA_DENVER MIDR_CPU_MODEL(ARM_CPU_IMP_NVIDIA, NVIDIA_CPU_PART_DENVER)
 #define MIDR_NVIDIA_CARMEL MIDR_CPU_MODEL(ARM_CPU_IMP_NVIDIA, NVIDIA_CPU_PART_CARMEL)
+#define MIDR_KRYO2XX_GOLD \
+	MIDR_CPU_MODEL(ARM_CPU_IMP_QCOM, ARM_CPU_PART_KRYO2XX_GOLD)
+#define MIDR_KRYO2XX_SILVER \
+	MIDR_CPU_MODEL(ARM_CPU_IMP_QCOM, ARM_CPU_PART_KRYO2XX_SILVER)
 
 #ifndef __ASSEMBLY__
 
 #include <asm/sysreg.h>
 
 #define read_cpuid(reg)			read_sysreg_s(SYS_ ## reg)
+
+/*
+ * Represent a range of MIDR values for a given CPU model and a
+ * range of variant/revision values.
+ *
+ * @model	- CPU model as defined by MIDR_CPU_MODEL
+ * @rv_min	- Minimum value for the revision/variant as defined by
+ *		  MIDR_CPU_VAR_REV
+ * @rv_max	- Maximum value for the variant/revision for the range.
+ */
+struct midr_range {
+	u32 model;
+	u32 rv_min;
+	u32 rv_max;
+};
+
+#define GENERIC_MIDR_RANGE(m, v_min, r_min, v_max, r_max)	\
+	{							\
+		.model = m,					\
+		.rv_min = MIDR_CPU_VAR_REV(v_min, r_min),	\
+		.rv_max = MIDR_CPU_VAR_REV(v_max, r_max),	\
+	}
+
+#define GENERIC_MIDR_ALL_VERSIONS(m) GENERIC_MIDR_RANGE(m, 0, 0, 0xf, 0xf)
+
+static inline bool is_midr_in_range(u32 midr, struct midr_range const *range)
+{
+	return MIDR_IS_CPU_MODEL_RANGE(midr, range->model,
+				 range->rv_min, range->rv_max);
+}
+
+static inline bool
+is_midr_in_range_list(u32 midr, struct midr_range const *ranges)
+{
+	while (ranges->model)
+		if (is_midr_in_range(midr, ranges++))
+			return true;
+	return false;
+}
 
 /*
  * The CPU ID never changes at run time, so we might as well tell the
